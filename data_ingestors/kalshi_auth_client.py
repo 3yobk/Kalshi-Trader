@@ -97,6 +97,11 @@ class KalshiAuthClient:
     async def _post(self, path: str, payload: dict) -> dict:
         headers = {"Content-Type": "application/json", **self._signed_headers("POST", path)}
         response = await self._client.post(path, json=payload, headers=headers)
+        if not response.is_success:
+            import sys
+            print(f"\n>>> KALSHI POST {path} → {response.status_code}", file=sys.stderr)
+            print(f">>> REQUEST:  {payload}", file=sys.stderr)
+            print(f">>> RESPONSE: {response.text[:500]}\n", file=sys.stderr)
         response.raise_for_status()
         return response.json()
 
@@ -155,14 +160,17 @@ def _sign_pss_text(private_key: rsa.RSAPrivateKey, text: str) -> str:
 def build_post_only_yes_bid_order(ticker: str, quantity: int, limit_price_cents: int) -> LiveOrderRequest:
     if quantity <= 0:
         raise ValueError("quantity must be positive")
-    if not 1 <= limit_price_cents <= 99:
+    # Post-only orders must not cross the spread. Bid one cent below the ask
+    # so the order rests on the book rather than immediately filling as a taker.
+    post_only_price = max(1, limit_price_cents - 1)
+    if not 1 <= post_only_price <= 99:
         raise ValueError("limit_price_cents must be between 1 and 99")
     return LiveOrderRequest(
         ticker=ticker,
         client_order_id=f"weatherbot-{uuid4().hex}",
         side="bid",
         count=f"{quantity:.2f}",
-        price=f"{limit_price_cents / 100:.4f}",
+        price=f"{post_only_price / 100:.4f}",
         time_in_force="good_till_canceled",
         self_trade_prevention_type="taker_at_cross",
         post_only=True,

@@ -123,7 +123,7 @@ async def run_once() -> None:
                     estimate.probability,
                     ask,
                     estimate.probability - (ask / 100),
-                )
+                    )
                 continue
 
             daily_pnl = await store.get_daily_pnl()
@@ -152,15 +152,59 @@ async def run_once() -> None:
                 quantity=decision.max_contracts if decision.allowed else 0,
                 reason="edge_trade" if decision.allowed else "risk_rejected",
             )
-            fill = executor.submit_limit_order(order, orderbook) if decision.allowed else PaperFill(
-                contract.ticker,
-                "yes",
-                0,
-                0,
-                None,
-                ask,
-                datetime.now(timezone.utc),
-            )
+
+            if decision.allowed and settings.bot_env == "live":
+                live_order = build_post_only_yes_bid_order(
+                    ticker=contract.ticker,
+                    quantity=decision.max_contracts,
+                    limit_price_cents=ask,
+                )
+                auth_client = _make_kalshi_auth_client()
+                if auth_client is None:
+                    fill = PaperFill(contract.ticker, "yes", 0, 0, None, ask, datetime.now(timezone.utc))
+                else:
+                    try:
+                        result = await auth_client.create_event_order(live_order)
+                        await store.log_live_order_event(
+                            event_type="auto_submit_success",
+                            raw=result,
+                            order_id=result.get("order_id"),
+                            client_order_id=result.get("client_order_id") or live_order.client_order_id,
+                            ticker=contract.ticker,
+                            side="yes",
+                            limit_price_cents=ask,
+                            quantity=decision.max_contracts,
+                            notional_dollars=decision.max_contracts * ask / 100,
+                            status="submitted",
+                        )
+                        fill = PaperFill(contract.ticker, "yes", decision.max_contracts, ask, ask, ask, datetime.now(timezone.utc))
+                    except Exception as exc:
+                        await store.log_live_order_event(
+                            event_type="auto_submit_error",
+                            raw={"error": str(exc)},
+                            client_order_id=live_order.client_order_id,
+                            ticker=contract.ticker,
+                            side="yes",
+                            limit_price_cents=ask,
+                            quantity=decision.max_contracts,
+                            notional_dollars=decision.max_contracts * ask / 100,
+                            status="error",
+                            message=exc.__class__.__name__,
+                        )
+                        fill = PaperFill(contract.ticker, "yes", 0, 0, None, ask, datetime.now(timezone.utc))
+                    finally:
+                        await auth_client.close()
+            else:
+                fill = executor.submit_limit_order(order, orderbook) if decision.allowed else PaperFill(
+                    contract.ticker,
+                    "yes",
+                    0,
+                    0,
+                    None,
+                    ask,
+                    datetime.now(timezone.utc),
+                )
+
             await store.log_trade(order, fill, decision)
             logger.info(
                 "%s station=%s p=%.3f ask=%s edge=%.3f allowed=%s reasons=%s filled=%d",
@@ -172,7 +216,7 @@ async def run_once() -> None:
                 decision.allowed,
                 ",".join(decision.reasons),
                 fill.filled_quantity,
-            )
+                )
     finally:
         await kalshi.close()
         await noaa.close()
@@ -886,12 +930,12 @@ async def exposure_report() -> None:
 
 
 async def live_order_preview_or_submit(
-    *,
-    submit: bool,
-    ticker: str | None,
-    limit_cents: int | None,
-    quantity: int | None,
-    confirmed: bool,
+        *,
+        submit: bool,
+        ticker: str | None,
+        limit_cents: int | None,
+        quantity: int | None,
+        confirmed: bool,
 ) -> None:
     if not ticker or limit_cents is None or quantity is None:
         print("Usage:")

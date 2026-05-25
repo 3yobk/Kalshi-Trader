@@ -13,25 +13,25 @@ echo  ========================================
 echo.
 
 REM ── 1. Create venv if missing ──────────────────────────────
-echo [1/5] Setting up Python environment...
+echo [1/6] Setting up Python environment...
 python -m venv "%VENV_DIR%" 2>nul
 echo       OK.
 
 REM ── 2. Install Python deps ─────────────────────────────────
-echo [2/5] Installing Python dependencies...
+echo [2/6] Installing Python dependencies...
 "%VENV_DIR%\Scripts\python.exe" -m pip install --quiet -r "%SCRIPT_DIR%requirements.txt" 2>nul
 "%VENV_DIR%\Scripts\python.exe" -m pip install --quiet "fastapi>=0.111" "uvicorn[standard]>=0.29" 2>nul
 echo       Done.
 
-REM ── 3. Install Node deps (npm ci is a no-op if up to date) ─
-echo [3/5] Installing Node dependencies...
+REM ── 3. Install Node deps ────────────────────────────────────
+echo [3/6] Installing Node dependencies...
 pushd "%UI_DIR%"
 call npm install --prefer-offline --silent
 popd
 echo       Done.
 
 REM ── 4. Write .env.local for the frontend ───────────────────
-echo [4/5] Checking frontend config...
+echo [4/6] Checking frontend config...
 pushd "%UI_DIR%"
 if not exist ".env.local" (
     echo VITE_BOT_API_URL=http://127.0.0.1:%BACKEND_PORT%> ".env.local"
@@ -41,8 +41,8 @@ if not exist ".env.local" (
 )
 popd
 
-REM ── 5. Launch both servers ─────────────────────────────────
-echo [5/5] Starting servers...
+REM ── 5. Launch backend + dashboard ──────────────────────────
+echo [5/6] Starting API backend and dashboard...
 
 start "Backend  (port %BACKEND_PORT%)" cmd /k ""%VENV_DIR%\Scripts\uvicorn.exe" api_server:app --host 127.0.0.1 --port %BACKEND_PORT%"
 
@@ -54,13 +54,19 @@ popd
 
 timeout /t 5 /nobreak >nul
 
+REM ── 6. Launch the bot in polling mode ──────────────────────
+echo [6/6] Starting Kalshi bot (live polling every 60s)...
+start "Kalshi Bot (live)" cmd /k ""%VENV_DIR%\Scripts\python.exe" "%SCRIPT_DIR%main.py""
+
 echo.
-echo  ====================================================
+echo  ============================================================
 echo   Backend  : http://127.0.0.1:%BACKEND_PORT%/api/health
 echo   Dashboard: http://127.0.0.1:%FRONTEND_PORT%
-echo  ====================================================
+echo   Bot      : polling every 60s (see "Kalshi Bot" window)
+echo  ============================================================
 echo.
-echo  Two console windows are running. Close them to stop.
+echo  Three console windows are running.
+echo  Close them all to stop everything.
 echo.
 
 start "" "http://127.0.0.1:%FRONTEND_PORT%"

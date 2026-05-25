@@ -15,8 +15,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 from config import load_config
 from data_ingestors.kalshi_auth_client import KalshiAuthClient
@@ -678,3 +679,312 @@ async def get_risk() -> dict[str, Any]:
 @app.get("/api/health")
 async def health() -> dict[str, str]:
     return {"status": "ok", "ts": datetime.now(timezone.utc).isoformat()}
+
+
+# ---------------------------------------------------------------------------
+# POST /api/run-once  — trigger one bot polling cycle
+# ---------------------------------------------------------------------------
+
+import subprocess
+import sys
+
+_run_lock = asyncio.Lock()
+_last_run: dict[str, Any] = {"status": "never", "started_at": None, "finished_at": None, "log": []}
+
+@app.post("/api/run-once")
+async def run_once_endpoint() -> dict[str, Any]:
+    if _run_lock.locked():
+        return {"ok": False, "error": "A run is already in progress"}
+    async with _run_lock:
+        started = datetime.now(timezone.utc).isoformat()
+        _last_run.update({"status": "running", "started_at": started, "finished_at": None, "log": []})
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, "main.py", "--once",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=300)
+            lines = stdout.decode(errors="replace").splitlines()[-60:]
+            finished = datetime.now(timezone.utc).isoformat()
+            ok = proc.returncode == 0
+            _last_run.update({
+                "status": "ok" if ok else "error",
+                "started_at": started,
+                "finished_at": finished,
+                "log": lines,
+                "exit_code": proc.returncode,
+            })
+            return {"ok": ok, "exit_code": proc.returncode, "log": lines}
+        except asyncio.TimeoutError:
+            _last_run.update({"status": "timeout", "finished_at": datetime.now(timezone.utc).isoformat()})
+            return {"ok": False, "error": "Bot run timed out after 5 minutes"}
+        except Exception as exc:
+            _last_run.update({"status": "error", "finished_at": datetime.now(timezone.utc).isoformat(), "log": [str(exc)]})
+            return {"ok": False, "error": str(exc)}
+
+
+@app.get("/api/run-status")
+async def run_status() -> dict[str, Any]:
+    return {**_last_run, "running": _run_lock.locked()}
+
+
+# ---------------------------------------------------------------------------
+# GET /api/unresolved  — tickers with no recorded outcome yet
+# ---------------------------------------------------------------------------
+
+@app.get("/api/unresolved")
+async def get_unresolved(limit: int = Query(100, ge=1, le=500)) -> list[dict[str, Any]]:
+    store = await _get_store()
+    settings, config = load_config()
+    tickers = await store.get_unresolved_probability_tickers(limit=limit)
+
+    kalshi = KalshiClient(settings.kalshi_base_url)
+    results = []
+    try:
+        for ticker in tickers:
+            try:
+                market = await kalshi.get_market(ticker)
+                status = market.get("status") or market.get("settlement_status") or "unknown"
+                result = market.get("result")
+                expiration_value = market.get("expiration_value")
+                close_time = market.get("close_time") or market.get("expiration_time") or ""
+            except Exception:
+                status = "fetch_error"
+                result = None
+                expiration_value = None
+                close_time = ""
+            results.append({
+                "ticker": ticker,
+                "status": status,
+                "result": result,
+                "expiration_value": expiration_value,
+                "close_time": close_time,
+            })
+    finally:
+        await kalshi.close()
+    return results
+
+
+# ---------------------------------------------------------------------------
+# POST /api/record-outcome  — manually record one outcome
+# ---------------------------------------------------------------------------
+
+class RecordOutcomeRequest(BaseModel):
+    ticker: str
+    outcome: str  # "yes" or "no"
+
+@app.post("/api/record-outcome")
+async def record_outcome_endpoint(req: RecordOutcomeRequest) -> dict[str, Any]:
+    if req.outcome not in {"yes", "no"}:
+        raise HTTPException(status_code=400, detail="outcome must be 'yes' or 'no'")
+    store = await _get_store()
+    result = await store.record_outcome(ticker=req.ticker, outcome=req.outcome == "yes")
+    if result == 1:
+        return {"ok": True, "ticker": req.ticker, "outcome": req.outcome, "detail": "recorded"}
+    elif result == -1:
+        return {"ok": False, "ticker": req.ticker, "detail": "already recorded"}
+    else:
+        return {"ok": False, "ticker": req.ticker, "detail": "no probability record found for this ticker"}
+
+
+# ---------------------------------------------------------------------------
+# POST /api/settlement-sync  — auto-record Kalshi-confirmed settlements
+# ---------------------------------------------------------------------------
+
+@app.post("/api/settlement-sync")
+async def settlement_sync_endpoint(limit: int = Query(50, ge=1, le=200)) -> dict[str, Any]:
+    store = await _get_store()
+    settings, _ = load_config()
+    tickers = await store.get_unresolved_probability_tickers(limit=limit)
+
+    if not tickers:
+        return {"ok": True, "recorded": 0, "skipped": 0, "previews": []}
+
+    kalshi = KalshiClient(settings.kalshi_base_url)
+    recorded = 0
+    skipped = 0
+    previews: list[dict[str, Any]] = []
+
+    def _settlement_outcome(market: dict[str, Any]) -> bool | None:
+        result = market.get("result")
+        if isinstance(result, str):
+            n = result.strip().lower()
+            if n == "yes": return True
+            if n == "no": return False
+        value = market.get("expiration_value")
+        if isinstance(value, str):
+            n = value.strip().lower()
+            if n in {"yes", "y", "true", "1"}: return True
+            if n in {"no", "n", "false", "0"}: return False
+        return None
+
+    try:
+        for ticker in tickers:
+            try:
+                market = await kalshi.get_market(ticker)
+            except Exception as exc:
+                previews.append({"ticker": ticker, "action": "error", "detail": str(exc)})
+                skipped += 1
+                continue
+
+            outcome = _settlement_outcome(market)
+            status = market.get("status") or market.get("settlement_status") or "unknown"
+
+            if outcome is None:
+                previews.append({"ticker": ticker, "action": "skip", "detail": f"no settlement value (status={status})"})
+                skipped += 1
+                continue
+
+            result = await store.record_outcome(ticker, outcome)
+            if result == 1:
+                recorded += 1
+                previews.append({"ticker": ticker, "action": "recorded", "outcome": "yes" if outcome else "no"})
+            elif result == -1:
+                skipped += 1
+                previews.append({"ticker": ticker, "action": "skip", "detail": "already recorded"})
+            else:
+                skipped += 1
+                previews.append({"ticker": ticker, "action": "skip", "detail": "no probability record"})
+    finally:
+        await kalshi.close()
+
+    return {"ok": True, "recorded": recorded, "skipped": skipped, "previews": previews}
+
+
+# ---------------------------------------------------------------------------
+# GET /api/decisions/history  — edge + allowed-rate over time for charting
+# ---------------------------------------------------------------------------
+
+@app.get("/api/decisions/history")
+async def get_decisions_history(limit: int = Query(200, ge=1, le=1000)) -> list[dict[str, Any]]:
+    store = await _get_store()
+    rows = await store.get_report_rows(limit=limit)
+    result = []
+    for r in rows:
+        result.append({
+            "created_at": r.get("created_at") or "",
+            "ticker": r.get("ticker", ""),
+            "station": r.get("station") or "",
+            "probability": float(r.get("probability") or 0),
+            "edge": round(float(r.get("probability") or 0) - float(r.get("limit_price_cents") or 0) / 100, 4),
+            "risk_allowed": bool(r.get("risk_allowed")),
+            "forecast_age_minutes": float(r.get("forecast_age_minutes") or 0),
+        })
+    return list(reversed(result))  # oldest first for charting
+
+
+# ---------------------------------------------------------------------------
+# GET /api/mode  — current BOT_ENV and arm status
+# ---------------------------------------------------------------------------
+
+@app.get("/api/mode")
+async def get_mode() -> dict[str, Any]:
+    settings, config = load_config()
+    arm_path = Path("data") / "live_arm.json"
+    armed = False
+    arm_expires = None
+    arm_remaining = 0
+    if arm_path.exists():
+        try:
+            import json as _json
+            payload = _json.loads(arm_path.read_text(encoding="utf-8"))
+            expires_at = datetime.fromisoformat(str(payload.get("expires_at")).replace("Z", "+00:00")).astimezone(timezone.utc)
+            remaining = (expires_at - datetime.now(timezone.utc)).total_seconds()
+            if remaining > 0:
+                armed = True
+                arm_expires = expires_at.isoformat()
+                arm_remaining = int(remaining)
+        except Exception:
+            pass
+    return {
+        "bot_env": settings.bot_env,
+        "live_trading_enabled": settings.live_trading_enabled,
+        "paper_only": config.bot.paper_only,
+        "armed": armed,
+        "arm_expires": arm_expires,
+        "arm_remaining_seconds": arm_remaining,
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /api/set-mode  — flip BOT_ENV in .env
+# ---------------------------------------------------------------------------
+
+class SetModeRequest(BaseModel):
+    mode: str  # "paper" or "live"
+
+@app.post("/api/set-mode")
+async def set_mode_endpoint(req: SetModeRequest) -> dict[str, Any]:
+    if req.mode not in {"paper", "live"}:
+        raise HTTPException(status_code=400, detail="mode must be 'paper' or 'live'")
+    env_path = Path(".env")
+    if not env_path.exists():
+        raise HTTPException(status_code=404, detail=".env file not found in working directory")
+
+    lines = env_path.read_text(encoding="utf-8").splitlines()
+    updated = False
+    new_lines = []
+    for line in lines:
+        if line.startswith("BOT_ENV="):
+            new_lines.append(f"BOT_ENV={req.mode}")
+            updated = True
+        else:
+            new_lines.append(line)
+    if not updated:
+        new_lines.append(f"BOT_ENV={req.mode}")
+    env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+
+    # Re-read to confirm
+    settings, config = load_config()
+    return {
+        "ok": True,
+        "bot_env": settings.bot_env,
+        "live_trading_enabled": settings.live_trading_enabled,
+        "paper_only": config.bot.paper_only,
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /api/arm-live  — write the arm file (required before live order submits)
+# ---------------------------------------------------------------------------
+
+class ArmLiveRequest(BaseModel):
+    minutes: int = 5
+
+@app.post("/api/arm-live")
+async def arm_live_endpoint(req: ArmLiveRequest) -> dict[str, Any]:
+    settings, config = load_config()
+    if settings.bot_env != "live" or not settings.live_trading_enabled or config.bot.paper_only:
+        raise HTTPException(status_code=403, detail="Cannot arm: BOT_ENV must be 'live'. Use set-mode first.")
+    if not (1 <= req.minutes <= 60):
+        raise HTTPException(status_code=400, detail="minutes must be 1–60")
+
+    import json as _json
+    from datetime import timedelta
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=req.minutes)
+    arm_path = Path("data") / "live_arm.json"
+    arm_path.parent.mkdir(parents=True, exist_ok=True)
+    arm_path.write_text(_json.dumps({
+        "armed_at": datetime.now(timezone.utc).isoformat(),
+        "expires_at": expires_at.isoformat(),
+    }, indent=2), encoding="utf-8")
+
+    return {
+        "ok": True,
+        "armed": True,
+        "expires_at": expires_at.isoformat(),
+        "arm_remaining_seconds": req.minutes * 60,
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /api/disarm-live  — remove the arm file
+# ---------------------------------------------------------------------------
+
+@app.post("/api/disarm-live")
+async def disarm_live_endpoint() -> dict[str, Any]:
+    arm_path = Path("data") / "live_arm.json"
+    if arm_path.exists():
+        arm_path.unlink()
+    return {"ok": True, "armed": False}
