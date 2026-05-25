@@ -1,0 +1,14 @@
+[Unit]
+Description=Safe Kalshi Weather Bot Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=weatherbot
+Group=weatherbot
+WorkingDirectory=/opt/weather-bot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/weather-bot/.venv/bin/python main.py --monitor-once
+NoNewPrivileges=true
+PrivateTmp=true

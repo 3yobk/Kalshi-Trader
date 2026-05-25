@@ -1,0 +1,19 @@
+[Unit]
+Description=Safe Kalshi Weather Paper Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=weatherbot
+Group=weatherbot
+WorkingDirectory=/opt/weather-bot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/weather-bot/.venv/bin/python main.py
+Restart=on-failure
+RestartSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

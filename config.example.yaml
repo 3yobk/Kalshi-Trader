@@ -1,0 +1,67 @@
+bot:
+  poll_seconds: 60
+  paper_only: true
+  supported_stations:
+    - KNYC
+    - KORD
+    - KDEN
+    - KLAX
+    - KATL
+    - KMCI
+  station_points:
+    KNYC: {lat: 40.7128, lon: -74.0060}
+    KORD: {lat: 41.9742, lon: -87.9073}
+    KDEN: {lat: 39.8561, lon: -104.6737}
+    KLAX: {lat: 33.9416, lon: -118.4085}
+    KATL: {lat: 33.6407, lon: -84.4277}
+    KMCI: {lat: 39.2976, lon: -94.7139}
+
+kalshi:
+  weather_series_tickers:
+    - KXHIGHNY
+    - KXHIGHCHI
+    - KXHIGHDEN
+    - KXHIGHLAX
+    - KXHIGHTATL
+  series_station_map:
+    KXHIGHNY: KNYC
+    KXHIGHCHI: KORD
+    KXHIGHDEN: KDEN
+    KXHIGHLAX: KLAX
+    KXHIGHTATL: KATL
+  min_liquidity_contracts: 100
+  max_spread_cents: 8
+
+risk:
+  min_edge: 0.15
+  max_trade_dollars: 5.00
+  max_daily_loss_dollars: 20.00
+  max_unresolved_exposure_dollars: 15.00
+  max_event_date_exposure_dollars: 10.00
+  max_live_orders_per_day: 1
+  live_reject_cooldown_minutes: 10
+  min_auto_live_decisions: 100
+  min_auto_live_resolved_outcomes: 30
+  max_auto_live_brier_score: 0.25
+  require_positive_auto_live_pnl: true
+  max_market_exposure_fraction: 0.10
+  stale_data_minutes: 20
+  stale_forecast_minutes: 120
+  stale_metar_minutes: 20
+  near_expiration_minutes: 45
+  high_confidence_threshold: 0.90
+
+model:
+  base_sigma_f: 3.5
+  same_day_sigma_f: 2.0
+  metar_weight: 0.20
+  open_meteo_weight: 0.25
+  tomorrow_weight: 0.25
+  visual_crossing_weight: 0.20
+  weatherapi_weight: 0.15
+  meteostat_weight: 0.10
+  climatology_weight: 0.05
+  max_external_consensus_weight: 0.55
+  disagreement_sigma_threshold_f: 3.0
+  disagreement_sigma_penalty_per_f: 0.35
+  expiration_decay_strength: 0.35
