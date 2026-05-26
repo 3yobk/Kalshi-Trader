@@ -35,6 +35,22 @@ class MarketOrderBook:
         return max(level.price_cents for level in self.yes)
 
     @property
+    def best_no_ask_cents(self) -> int | None:
+        """Best ask price for NO contracts (= 100 - best YES bid)."""
+        bid = self.best_yes_bid_cents
+        if bid is None:
+            return None
+        return 100 - bid
+
+    @property
+    def best_no_bid_cents(self) -> int | None:
+        """Best bid price for NO contracts (= 100 - best YES ask)."""
+        ask = self.best_yes_ask_cents
+        if ask is None:
+            return None
+        return 100 - ask
+
+    @property
     def spread_cents(self) -> int | None:
         bid = self.best_yes_bid_cents
         ask = self.best_yes_ask_cents

@@ -29,22 +29,22 @@ kalshi:
     KXHIGHDEN: KDEN
     KXHIGHLAX: KLAX
     KXHIGHTATL: KATL
-  min_liquidity_contracts: 100
-  max_spread_cents: 8
+  min_liquidity_contracts: 50
+  max_spread_cents: 15
 
 risk:
-  min_edge: 0.15
-  max_trade_dollars: 5.00
-  max_daily_loss_dollars: 20.00
-  max_unresolved_exposure_dollars: 15.00
-  max_event_date_exposure_dollars: 10.00
-  max_live_orders_per_day: 1
+  min_edge: 0.12
+  max_trade_dollars: 10.00
+  max_daily_loss_dollars: 40.00
+  max_unresolved_exposure_dollars: 35.00
+  max_event_date_exposure_dollars: 20.00
+  max_live_orders_per_day: 3
   live_reject_cooldown_minutes: 10
   min_auto_live_decisions: 100
   min_auto_live_resolved_outcomes: 30
   max_auto_live_brier_score: 0.25
   require_positive_auto_live_pnl: true
-  max_market_exposure_fraction: 0.10
+  max_market_exposure_fraction: 0.15
   stale_data_minutes: 20
   stale_forecast_minutes: 120
   stale_metar_minutes: 20

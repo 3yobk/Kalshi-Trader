@@ -18,7 +18,7 @@ from data_ingestors.external_weather_clients import (
     VisualCrossingClient,
     WeatherApiClient,
 )
-from data_ingestors.kalshi_auth_client import KalshiAuthClient, build_post_only_yes_bid_order
+from data_ingestors.kalshi_auth_client import KalshiAuthClient, build_post_only_yes_bid_order, build_post_only_no_ask_order
 from data_ingestors.kalshi_client import KalshiClient
 from data_ingestors.metar_client import MetarClient
 from data_ingestors.noaa_client import NoaaClient
@@ -207,16 +207,90 @@ async def run_once() -> None:
 
             await store.log_trade(order, fill, decision)
             logger.info(
-                "%s station=%s p=%.3f ask=%s edge=%.3f allowed=%s reasons=%s filled=%d",
+                "%s station=%s p=%.3f ask=%s edge=%.3f kelly=%.1f%% allowed=%s reasons=%s filled=%d",
                 contract.ticker,
                 contract.station,
                 estimate.probability,
                 ask,
                 estimate.probability - market_probability,
+                decision.kelly_fraction * 100,
                 decision.allowed,
                 ",".join(decision.reasons),
                 fill.filled_quantity,
                 )
+
+            # ── NO-side evaluation ──────────────────────────────────────────
+            # When our model says p is LOW, the market may be overpricing YES.
+            # We can sell NO (ask NO) to capture edge on the other side.
+            no_bid = orderbook.best_no_bid_cents  # what buyers will pay for NO
+            if no_bid is not None and not await store.has_filled_paper_trade_today(contract.ticker + "-NO"):
+                no_probability = 1.0 - estimate.probability          # our p(NO)
+                no_market_price = no_bid / 100                        # market's implied p(NO)
+                no_edge = no_probability - no_market_price
+                no_spread = orderbook.spread_cents
+
+                no_decision = risk.evaluate(
+                    contract=contract,
+                    estimate=estimate.__class__(**{**estimate.__dict__, "probability": 1.0 - estimate.probability}),
+                    orderbook=orderbook,
+                    market_price_probability=no_market_price,
+                    daily_pnl=daily_pnl,
+                    market_exposure_dollars=exposure,
+                    unresolved_paper_exposure_dollars=unresolved_exposure,
+                    event_date_exposure_dollars=event_date_exposure,
+                    bankroll_dollars=200.0,
+                    halted=bool(market.get("halted") or market.get("is_halted")),
+                )
+
+                if no_decision.allowed:
+                    no_order = PaperOrder(
+                        ticker=contract.ticker,
+                        side="no",
+                        limit_price_cents=no_bid,
+                        quantity=no_decision.max_contracts,
+                        reason="no_edge_trade",
+                    )
+                    if settings.bot_env == "live":
+                        no_live_order = build_post_only_no_ask_order(
+                            ticker=contract.ticker,
+                            quantity=no_decision.max_contracts,
+                            limit_price_cents=no_bid,
+                        )
+                        no_auth_client = _make_kalshi_auth_client()
+                        if no_auth_client is None:
+                            no_fill = PaperFill(contract.ticker, "no", 0, 0, None, no_bid, datetime.now(timezone.utc))
+                        else:
+                            try:
+                                no_result = await no_auth_client.create_event_order(no_live_order)
+                                await store.log_live_order_event(
+                                    event_type="no_auto_submit_success",
+                                    raw=no_result,
+                                    order_id=no_result.get("order_id"),
+                                    client_order_id=no_result.get("client_order_id") or no_live_order.client_order_id,
+                                    ticker=contract.ticker,
+                                    side="no",
+                                    limit_price_cents=no_bid,
+                                    quantity=no_decision.max_contracts,
+                                    notional_dollars=no_decision.max_contracts * no_bid / 100,
+                                    status="submitted",
+                                )
+                                no_fill = PaperFill(contract.ticker, "no", no_decision.max_contracts, no_bid, no_bid, no_bid, datetime.now(timezone.utc))
+                            except Exception as exc:
+                                logger.warning("NO-side order failed for %s: %s", contract.ticker, exc)
+                                no_fill = PaperFill(contract.ticker, "no", 0, 0, None, no_bid, datetime.now(timezone.utc))
+                            finally:
+                                await no_auth_client.close()
+                    else:
+                        no_fill = executor.submit_limit_order(no_order, orderbook) if no_decision.allowed else PaperFill(
+                            contract.ticker, "no", 0, 0, None, no_bid, datetime.now(timezone.utc)
+                        )
+
+                    await store.log_trade(no_order, no_fill, no_decision)
+                    logger.info(
+                        "%s NO station=%s p(no)=%.3f no_bid=%s edge=%.3f filled=%d",
+                        contract.ticker, contract.station,
+                        no_probability, no_bid, no_edge, no_fill.filled_quantity,
+                    )
     finally:
         await kalshi.close()
         await noaa.close()
@@ -1760,7 +1834,7 @@ def _nonzero_positions(payload: dict[str, Any]) -> list[dict[str, Any]]:
     positions = payload.get("market_positions") or payload.get("positions") or []
     nonzero = []
     for position in positions:
-        quantity = position.get("position") or position.get("yes_count") or position.get("quantity") or 0
+        quantity = position.get("position_fp") or position.get("position") or position.get("yes_count") or position.get("quantity") or 0
         try:
             if float(quantity) != 0:
                 nonzero.append(position)

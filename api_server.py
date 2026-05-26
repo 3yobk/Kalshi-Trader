@@ -107,7 +107,8 @@ def _nonzero_positions(payload: dict[str, Any]) -> list[dict[str, Any]]:
     positions = payload.get("market_positions") or payload.get("positions") or []
     result = []
     for p in positions:
-        qty = p.get("position") or p.get("yes_count") or p.get("quantity") or 0
+        # Kalshi returns position_fp (fixed-point string) as the quantity field
+        qty = p.get("position_fp") or p.get("position") or p.get("yes_count") or p.get("quantity") or 0
         try:
             if float(qty) != 0:
                 result.append(p)
@@ -601,28 +602,22 @@ async def get_live_orders() -> list[dict[str, Any]]:
 
 @app.get("/api/live/positions")
 async def get_live_positions() -> list[dict[str, Any]]:
-    settings, _ = load_config()
     client = _make_auth_client()
     if client is None:
         return []
     try:
         payload = await client.get_positions(limit=200)
         positions = _nonzero_positions(payload)
-        kalshi = KalshiClient(settings.kalshi_base_url)
         result = []
-        try:
-            for p in positions:
-                ticker = p.get("ticker", "")
-                qty = int(p.get("position") or p.get("yes_count") or p.get("quantity") or 0)
-                avg = int(p.get("avg_price") or p.get("average_price") or 0)
-                try:
-                    ob = await kalshi.get_orderbook(ticker)
-                    mark = ob.best_yes_bid_cents or 0
-                except Exception:
-                    mark = 0
-                result.append({"ticker": ticker, "qty": qty, "avg_price_cents": avg, "mark_cents": mark})
-        finally:
-            await kalshi.close()
+        for p in positions:
+            ticker = p.get("ticker", "")
+            qty = int(float(p.get("position_fp") or p.get("position") or p.get("yes_count") or p.get("quantity") or 0))
+            total_traded = float(p.get("total_traded_dollars") or 0)
+            avg = int(total_traded / qty * 100) if qty else 0
+            # Use Kalshi's own market_exposure_dollars — same value they show in the UI
+            market_exposure = float(p.get("market_exposure_dollars") or 0)
+            mark = int(market_exposure / qty * 100) if qty else avg
+            result.append({"ticker": ticker, "qty": qty, "avg_price_cents": avg, "mark_cents": mark})
         return result
     except Exception as exc:
         logger.warning("get_live_positions error: %s", exc)

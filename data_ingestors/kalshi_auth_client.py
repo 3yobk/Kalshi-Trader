@@ -78,7 +78,7 @@ class KalshiAuthClient:
         return await self._get("/portfolio/balance")
 
     async def get_positions(self, limit: int = 100) -> dict:
-        return await self._get(f"/portfolio/positions?limit={limit}")
+        return await self._get(f"/portfolio/positions?limit={limit}&settlement_status=unsettled")
 
     async def get_orders(self, limit: int = 100) -> dict:
         return await self._get(f"/portfolio/orders?limit={limit}")
@@ -169,6 +169,28 @@ def build_post_only_yes_bid_order(ticker: str, quantity: int, limit_price_cents:
         ticker=ticker,
         client_order_id=f"weatherbot-{uuid4().hex}",
         side="bid",
+        count=f"{quantity:.2f}",
+        price=f"{post_only_price / 100:.4f}",
+        time_in_force="good_till_canceled",
+        self_trade_prevention_type="taker_at_cross",
+        post_only=True,
+        cancel_order_on_pause=True,
+        exchange_index=0,
+    )
+
+
+def build_post_only_no_ask_order(ticker: str, quantity: int, limit_price_cents: int) -> LiveOrderRequest:
+    """Build a post-only NO ask order. limit_price_cents is the NO price (= 100 - YES bid).
+    We offer one cent above the current NO bid to rest passively on the book."""
+    if quantity <= 0:
+        raise ValueError("quantity must be positive")
+    post_only_price = min(99, limit_price_cents + 1)
+    if not 1 <= post_only_price <= 99:
+        raise ValueError("limit_price_cents must be between 1 and 99")
+    return LiveOrderRequest(
+        ticker=ticker,
+        client_order_id=f"weatherbot-no-{uuid4().hex}",
+        side="ask",
         count=f"{quantity:.2f}",
         price=f"{post_only_price / 100:.4f}",
         time_in_force="good_till_canceled",
